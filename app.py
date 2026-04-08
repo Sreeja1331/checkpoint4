@@ -8,7 +8,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
@@ -41,7 +41,7 @@ multi_thresholds = load_artifact("multi_label_thresholds.pkl")
 multilabel_artifacts = load_artifact("multilabel_inference_artifacts.pkl")
 
 MULTILABEL_FEATURE_COUNT = getattr(multilabel_model.estimators_[0], "n_features_in_", None)
-MULTILABEL_FEATURE_COLUMNS = list(getattr(multilabel_model, "feature_names_in_", multilabel_artifacts["feature_columns"]))
+MULTILABEL_FEATURE_COLUMNS = list(multilabel_artifacts["feature_columns"])
 MULTILABEL_LABEL_CLASSES = multilabel_artifacts["label_classes"]
 
 BINARY_HASH_COLS = {
@@ -80,12 +80,39 @@ ARTIFACT_WARNINGS = {
         "matches unseen-category handling but may reduce accuracy."
     ),
     "multilabel": (
-        "The multilabel notebook used `label_count` as an input feature even "
-        "though it is target-derived. This API recreates the rest of the 162-column "
-        "preprocessing exactly and fills `label_count` with a default fallback "
-        "unless you provide it explicitly."
+        "The multilabel endpoint depends on the exported preprocessing artifacts. "
+        "If predictions look unstable, retrain with `train_multilabel_pipeline.py` "
+        "to regenerate the model and inference metadata together."
     ),
 }
+
+INPUT_ALIASES = {
+    "Deduct": "Deduc",
+    "Deduction": "Deduc",
+    "Coins": "CoIns",
+    "Coinsurance": "CoIns",
+    "SameDayClm": "SameDayCli",
+    "SameDayClaim": "SameDayCli",
+    "DaysBestServiceToBilling": "DaysBetServiceToBilling",
+    "DaysBetweenServiceToBilling": "DaysBetServiceToBilling",
+}
+
+MULTIFLAG_RECOMMENDED_FIELDS = [
+    "Clinic",
+    "Service",
+    "CPTCode",
+    "Payer",
+    "Provider",
+    "eligStatus",
+    "tpcliStrPOS",
+    "f21diag1",
+    "AmountCharged",
+    "CoPay",
+    "Deduc",
+    "CoIns",
+    "SameDayCli",
+    "DaysBetServiceToBilling",
+]
 
 
 class ClaimRequest(BaseModel):
@@ -119,7 +146,16 @@ def stable_hash_number(value: Any, modulus: int = 100_000) -> float:
 
 
 def base_frame(claim_features: dict[str, Any]) -> pd.DataFrame:
+    claim_features = normalize_input_keys(claim_features)
     return pd.DataFrame([claim_features]).copy()
+
+
+def normalize_input_keys(claim_features: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(claim_features)
+    for source_key, target_key in INPUT_ALIASES.items():
+        if source_key in normalized and target_key not in normalized:
+            normalized[target_key] = normalized[source_key]
+    return normalized
 
 
 def add_common_date_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,6 +206,14 @@ def preprocess_binary(claim_features: dict[str, Any]) -> tuple[pd.DataFrame, lis
 def preprocess_multiflag(claim_features: dict[str, Any]) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = [ARTIFACT_WARNINGS["multiflag"]]
     df = add_common_date_features(base_frame(claim_features))
+    normalized_input = normalize_input_keys(claim_features)
+
+    missing_fields = [field for field in MULTIFLAG_RECOMMENDED_FIELDS if field not in normalized_input]
+    if missing_fields:
+        warnings.append(
+            "Missing recommended multiflag fields: " + ", ".join(missing_fields) + ". "
+            "When many of these are omitted, predictions often collapse to the same class."
+        )
 
     amount = as_float(df.get("AmountCharged", pd.Series([0])).iloc[0])
     copay = as_float(df.get("CoPay", pd.Series([0])).iloc[0])
@@ -210,6 +254,18 @@ def preprocess_multiflag(claim_features: dict[str, Any]) -> tuple[pd.DataFrame, 
     numeric_cols = [col for col in multiflag_cols if col not in MULTIFLAG_CATEGORY_COLS]
     aligned[numeric_cols] = aligned[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
+    zeroed_high_card_cols = []
+    for col in MULTIFLAG_FREQ_FALLBACK_COLS:
+        if col in aligned.columns and float(aligned.at[0, col]) == 0.0:
+            zeroed_high_card_cols.append(col)
+
+    if zeroed_high_card_cols:
+        warnings.append(
+            "These high-cardinality fields were treated as unseen and mapped to 0.0: "
+            + ", ".join(zeroed_high_card_cols)
+            + ". Predictions may skew toward the model's common classes."
+        )
+
     return aligned, warnings
 
 
@@ -217,70 +273,34 @@ def preprocess_multilabel(claim_features: dict[str, Any]) -> tuple[pd.DataFrame,
     warnings: list[str] = [ARTIFACT_WARNINGS["multilabel"]]
     df = add_common_date_features(base_frame(claim_features))
 
-    df["service_day"] = as_float(df.get("service_day", pd.Series([0])).iloc[0], default=0.0)
     if "ServiceDt" in claim_features:
         service_dt = parse_date(claim_features.get("ServiceDt"))
         if pd.notna(service_dt):
             df["service_day"] = float(service_dt.day)
 
-    df["eligStatus"] = (
-        str(df.get("eligStatus", pd.Series(["unknown"])).iloc[0] or "unknown")
-    )
-    df["tpcliStrModifier"] = (
-        str(df.get("tpcliStrModifier", pd.Series(["missing"])).iloc[0] or "missing")
-    )
-
-    default_label_count = multilabel_artifacts["default_label_count"]
-    label_count = as_float(
-        claim_features.get("label_count", default_label_count),
-        default=float(default_label_count),
-    )
-    if "label_count" not in claim_features:
-        warnings.append(
-            f"`label_count` was not provided; using fallback value {default_label_count}."
-        )
-    df["label_count"] = label_count
+    for col in multilabel_artifacts["cat_cols"]:
+        df[col] = str(df.get(col, pd.Series(["missing"])).iloc[0] or "missing")
 
     cpt_code = claim_features.get("CPTCode")
     payer = claim_features.get("Payer")
-    df["cpt_denial_rate"] = as_float(
-        multilabel_artifacts["cpt_denial_rate"].get(cpt_code, 0.0)
-    )
-    df["payer_denial_rate"] = as_float(
-        multilabel_artifacts["payer_denial_rate"].get(payer, 0.0)
-    )
+    df["cpt_denial_rate"] = as_float(multilabel_artifacts["cpt_denial_rate"].get(cpt_code, 0.0))
+    df["payer_denial_rate"] = as_float(multilabel_artifacts["payer_denial_rate"].get(payer, 0.0))
 
     for col in multilabel_artifacts["high_card_cols"]:
-        value = claim_features.get(col)
+        raw_value = claim_features.get(col)
         freq_map = multilabel_artifacts["freq_maps"].get(col, {})
-        df[f"{col}_freq"] = as_float(freq_map.get(value, 0.0))
+        df[f"{col}_freq"] = as_float(freq_map.get(raw_value, 0.0))
 
-    cols_to_drop = [
-        col
-        for col in [
-            "Clinic",
-            "ClientID",
-            "Payer",
-            "Provider",
-            "BillingProviderNPI",
-            "ClaimFacilityNPI",
-            "CPTCode",
-            "ServiceDt",
-            "ClaimBillDate",
-        ]
-        if col in df.columns
-    ]
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
+    keep_cols = list(multilabel_artifacts["base_feature_cols"]) + [
+        f"{col}_freq" for col in multilabel_artifacts["high_card_cols"]
+    ] + list(multilabel_artifacts["cat_cols"])
 
-    dummy_cols = [col for col in multilabel_artifacts["cat_cols"] if col in df.columns]
-    df = pd.get_dummies(df, columns=dummy_cols, drop_first=True)
+    for col in keep_cols:
+        if col not in df.columns:
+            df[col] = 0.0 if col not in multilabel_artifacts["cat_cols"] else "missing"
 
-    amount = as_float(claim_features.get("AmountCharged", 0.0))
-    df["log_amount"] = float(np.log1p(max(amount, 0.0)))
-    if "AmountCharged" in df.columns:
-        df = df.drop(columns=["AmountCharged"])
-
+    df = df[keep_cols].copy()
+    df = pd.get_dummies(df, columns=multilabel_artifacts["cat_cols"], drop_first=True)
     df = df.reindex(columns=MULTILABEL_FEATURE_COLUMNS, fill_value=0.0)
     df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
@@ -337,6 +357,16 @@ def predict_multiflag(req: ClaimRequest) -> dict[str, Any]:
     probs = multiflag_model.predict_proba(features)[0]
     classes = multiflag_model.classes_
     pred_idx = int(np.argmax(probs))
+    transformed_features = {}
+
+    for col in features.columns:
+        value = features.iloc[0][col]
+        if pd.isna(value):
+            transformed_features[col] = None
+        elif isinstance(value, (np.integer, np.floating)):
+            transformed_features[col] = float(value)
+        else:
+            transformed_features[col] = str(value)
 
     return {
         "multiflag": str(classes[pred_idx]),
@@ -344,6 +374,7 @@ def predict_multiflag(req: ClaimRequest) -> dict[str, Any]:
         "class_probabilities": {
             str(label): float(prob) for label, prob in zip(classes, probs)
         },
+        "transformed_features": transformed_features,
         "warnings": warnings,
     }
 
@@ -352,12 +383,18 @@ def predict_multiflag(req: ClaimRequest) -> dict[str, Any]:
 def predict_denial_reasons(req: ClaimRequest) -> dict[str, Any]:
     features, warnings = preprocess_multilabel(req.claim_features)
     probs = multilabel_model.predict_proba(features)
-    probs = np.asarray(probs)
-    if probs.ndim == 1:
-        probs = probs.reshape(1, -1)
 
-    labels: list[str] = []
-    scores: list[float] = []
+    if isinstance(probs, list):
+        probs = np.column_stack([arr[:, 1] for arr in probs])
+    else:
+        probs = np.asarray(probs)
+        if probs.ndim == 3:
+            probs = probs[:, :, 1]
+        elif probs.ndim == 1:
+            probs = probs.reshape(1, -1)
+
+    labels = []
+    scores = []
 
     for i, probability in enumerate(probs[0]):
         if probability > multi_thresholds[i]:
@@ -384,4 +421,5 @@ def predict_denial_reasons(req: ClaimRequest) -> dict[str, Any]:
         "top_predictions": ranked[:10],
         "warnings": warnings,
         "expected_feature_count": MULTILABEL_FEATURE_COUNT,
+        "training_metrics": multilabel_artifacts.get("metrics", {}),
     }
