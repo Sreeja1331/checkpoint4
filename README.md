@@ -422,6 +422,7 @@ This repository now contains:
 You can now:
 
 1. install dependencies
+pip install -r requirements.txt
 2. run `uvicorn app:app --reload`
 3. test the endpoints in `/docs`
 4. retrain the multilabel model when needed
