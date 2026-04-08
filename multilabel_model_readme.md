@@ -1,31 +1,16 @@
-# Multilabel Claim Denial README
+# Multilabel Denial Reasons Model README
 
 ## Overview
 
-This README focuses on the multilabel denial-reason model used in this project.
+This model predicts one or more denial reason labels for a claim.
 
-It covers:
-
-- data preprocessing steps
-- model training instructions
-- threshold selection logic
-- sample API request and response
-
-The multilabel model predicts one or more denial reason labels from the combined targets:
-
-- `target1`
-- `target2`
-- `target3`
-- `target4`
-
-Main files:
-
-- training notebook: `train_multilabel_pipeline.ipynb`
-- training script: `train_multilabel_pipeline.py`
-- API file: `app.py`
-- model artifact: `models/multilabel_model.pkl`
-- thresholds: `models/multi_label_thresholds.pkl`
-- inference metadata: `models/multilabel_inference_artifacts.pkl`
+- Task: multilabel classification
+- Targets: combined values from `target1`, `target2`, `target3`, `target4`
+- Label count: `24`
+- Endpoint: `POST /predict-denial-reasons/`
+- Model file: `models/multilabel_model.pkl`
+- Thresholds: `models/multi_label_thresholds.pkl`
+- Inference metadata: `models/multilabel_inference_artifacts.pkl`
 
 ## Data Preprocessing Steps
 
@@ -77,13 +62,13 @@ Duplicates are dropped using:
 
 ### 5. Prevent leakage
 
-The training flow removes columns that should not be used directly for prediction, including:
+The training flow removes:
 
 - `DenialFlag`
 - `lastActDt`
 - the raw target columns
 
-Also, the previous leaked `label_count` inference dependency was removed from the current implementation.
+Also, the leaked `label_count` dependency was removed from inference-time features in the current implementation.
 
 ### 6. Train/validation split
 
@@ -95,11 +80,9 @@ Grouping column:
 
 - `ClientID`
 
-This prevents the same client from appearing in both train and validation sets.
-
 ### 7. Feature engineering
 
-Numeric/base features:
+Base numeric features:
 
 - `AmountCharged`
 - `CoPay`
@@ -116,11 +99,7 @@ Rate-based features:
 - `cpt_denial_rate`
 - `payer_denial_rate`
 
-These are built from training data only.
-
-### 8. Encode high-cardinality columns
-
-These columns are frequency encoded:
+High-cardinality fields frequency encoded:
 
 - `Clinic`
 - `ClientID`
@@ -130,9 +109,7 @@ These columns are frequency encoded:
 - `ClaimFacilityNPI`
 - `CPTCode`
 
-### 9. Encode regular categorical columns
-
-These columns are one-hot encoded using `pd.get_dummies(..., drop_first=True)`:
+Regular categorical fields one-hot encoded:
 
 - `Service`
 - `eligStatus`
@@ -140,9 +117,9 @@ These columns are one-hot encoded using `pd.get_dummies(..., drop_first=True)`:
 - `tpcliStrPOS`
 - `f21diag1`
 
-### 10. Align inference columns
+### 8. Align inference columns
 
-The final transformed training feature columns are saved and reused at inference time so the API can reproduce the same feature layout.
+The final training feature layout is saved and reused at API inference time.
 
 ## Model Training Instructions
 
@@ -153,8 +130,6 @@ You can train the multilabel model in either of these two ways.
 Open and run:
 
 - `train_multilabel_pipeline.ipynb`
-
-Run all cells from top to bottom.
 
 ### Option 2. Run the Python script
 
@@ -175,22 +150,18 @@ It:
 7. tunes one threshold per label
 8. exports model and inference artifacts
 
-### Model used
+Model used:
 
 - `ClassifierChain`
 - base estimator: `LightGBM LGBMClassifier`
 
-### Exported files
-
-After training, the pipeline saves:
+Exported files:
 
 - `models/multilabel_model.pkl`
 - `models/multi_label_thresholds.pkl`
 - `models/multilabel_inference_artifacts.pkl`
 
-### Current metrics
-
-From the currently exported artifacts:
+Current metrics:
 
 - Train Micro F1: `0.9430`
 - Train Macro F1: `0.8587`
@@ -201,34 +172,27 @@ From the currently exported artifacts:
 
 ## Threshold Selection Logic
 
-This model does not use one fixed threshold for all labels.
-
-Instead, it uses threshold tuning per label.
+This model uses threshold tuning per label.
 
 ### How it works
 
 For each label:
 
-1. the model predicts probabilities on the validation set
-2. thresholds are tested from `0.10` to `0.60`
-3. the threshold with the best label-wise F1 score is selected
-4. that threshold is stored in `models/multi_label_thresholds.pkl`
+1. predict probabilities on the validation set
+2. test thresholds from `0.10` to `0.60`
+3. compute label-wise F1 score
+4. select the threshold with the best F1
+5. save all thresholds to `models/multi_label_thresholds.pkl`
 
 ### Why this is useful
 
-Different denial labels have different frequencies and difficulty levels.
-
-Using one shared threshold can hurt recall for rare labels or hurt precision for common labels.
-
-Per-label thresholds improve balance across labels.
+Different denial reason labels have different class frequencies, so a single shared threshold would not work well for all labels.
 
 ## Sample API Request
 
 Endpoint:
 
 - `POST /predict-denial-reasons/`
-
-Request body:
 
 ```json
 {
@@ -259,8 +223,6 @@ Request body:
 ```
 
 ## Sample API Response
-
-Example:
 
 ```json
 {
@@ -297,28 +259,3 @@ Example:
 }
 ```
 
-## How To Run the API
-
-Install dependencies:
-
-```bash
-pip install fastapi uvicorn pandas numpy joblib lightgbm scikit-learn pydantic
-```
-
-Start the server:
-
-```bash
-uvicorn app:app --reload
-```
-
-Open:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-## Notes
-
-- The model works best with realistic values similar to the training dataset.
-- Highly synthetic test rows can still collapse toward one dominant label.
-- If you retrain the multilabel model, regenerate all artifact files together.
